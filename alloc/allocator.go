@@ -170,14 +170,13 @@ func removeFromFreeList(h unsafe.Pointer) {
 	pf := blockPrevFree(h)
 	nf := blockNextFree(h)
 
-	// If pf != nil, set its next to nf; otherwise h was head
 	if pf != nil {
 		setBlockNextFree(pf, nf)
 	} else {
 		// h was the head
 		heaplist = nf
 	}
-	// If nf != nil, set its prev to pf
+
 	if nf != nil {
 		setBlockPrevFree(nf, pf)
 	}
@@ -194,14 +193,12 @@ func insertAtFreeListHead(h unsafe.Pointer) {
 
 // Create a free block of `size` at pointer h, mark header/footer, add to free list
 func createAtFreeListHead(h unsafe.Pointer, size uintptr) {
-	// Mark as free
 	setMd(h, size, false)
 	setMd(blockFooter(h), size, false)
 	insertAtFreeListHead(h)
 }
 
 func alignedSize(size int) int {
-	// Typically align to 8
 	const alignment = 8
 	return (size + alignment - 1) & ^(alignment - 1)
 }
@@ -255,7 +252,6 @@ func extendHeap(sizeNeeded int) unsafe.Pointer {
 		return nil
 	}
 
-	// create a free block of (sizeNeeded - 2*dWordSize)
 	createAtFreeListHead(p, uintptr(sizeNeeded)-2*dWordSize)
 
 	chunks = append(chunks, chunk{p, sizeNeeded})
@@ -264,14 +260,13 @@ func extendHeap(sizeNeeded int) unsafe.Pointer {
 }
 
 func findFreeBlock(size int) unsafe.Pointer {
-	// Linear search the free list
 	for c := heaplist; c != nil; c = blockNextFree(c) {
 		if blockSize(c) >= uintptr(size) {
 			return c
 		}
 	}
 
-	// If none found, extend the heap and return that new block
+	// Else, grow
 	return extendHeap(size)
 }
 
@@ -293,11 +288,9 @@ func allocateBlock(h unsafe.Pointer, size int) {
 		freeBlockPtr := byteOffset(h, int(uintptr(size)+2*dWordSize))
 		spare := oldSize - uintptr(size) - 2*dWordSize
 
-		// Mark leftover as free
 		setMd(freeBlockPtr, spare, false)
 		setMd(blockFooter(freeBlockPtr), spare, false)
 
-		// Coalesce leftover with its neighbors
 		coalesceBlock(freeBlockPtr)
 	}
 }
