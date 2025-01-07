@@ -20,7 +20,7 @@ type chunk struct {
 var (
 	heaplist  unsafe.Pointer = nil // head of free list
 	allocated int
-	chunks    []chunk = make([]chunk, 0)
+	chunks    []chunk = make([]chunk, 0) // we kindly ask go for just this one heap allocation
 )
 
 func mmap(length int) unsafe.Pointer {
