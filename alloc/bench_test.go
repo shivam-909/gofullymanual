@@ -4,31 +4,74 @@ import (
 	"testing"
 )
 
-const N = 100000
+const N = 10000
 
-func alloc_bench() {
-	for range N {
-		slice := Allocate[*[100]int](8 * N)
-		slice[0] = 1
-		Free(slice)
-	}
+func BenchmarkLargeAllocs(b *testing.B) {
+	b.Run("CustomAllocator", func(b *testing.B) {
+		p := Allocate[int](8)
+
+		for i := 0; i < b.N; i++ {
+			for j := 0; j < N; j++ {
+				slice := AllocateSlice[int](10000)
+				slice[0] = 1
+				FreeSlice(slice)
+			}
+		}
+		Free(p)
+	})
+
+	b.Run("StandardAllocator", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for j := 0; j < N; j++ {
+				slice := make([]int, 10000)
+				slice[0] = 1
+			}
+		}
+	})
 }
 
-func normal_bench() {
-	for range N {
-		slice := make([]int, N)
-		slice[0] = 1
-	}
+func BenchmarkSmallAllocs(b *testing.B) {
+	b.Run("CustomAllocator", func(b *testing.B) {
+		p := Allocate[int](8)
+		for i := 0; i < b.N; i++ {
+			for j := 0; j < N; j++ {
+				slice := AllocateSlice[int](5120)
+				slice[0] = 1
+				FreeSlice(slice)
+			}
+		}
+		Free(p)
+	})
+
+	b.Run("StandardAllocator", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for j := 0; j < N; j++ {
+				slice := make([]int, 5120)
+				slice[0] = 1
+			}
+		}
+	})
 }
 
-func BenchmarkMalloc(b *testing.B) {
-	for range b.N {
-		alloc_bench()
-	}
-}
+func BenchmarkTinyAllocs(b *testing.B) {
+	b.Run("CustomAllocator", func(b *testing.B) {
+		p := Allocate[int](8)
+		for i := 0; i < b.N; i++ {
+			for j := 0; j < N; j++ {
+				slice := AllocateSlice[int](256)
+				slice[0] = 1
+				FreeSlice(slice)
+			}
+		}
+		Free(p)
+	})
 
-func BenchmarkGc(b *testing.B) {
-	for range b.N {
-		normal_bench()
-	}
+	b.Run("StandardAllocator", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for j := 0; j < N; j++ {
+				slice := make([]int, 256)
+				slice[0] = 1
+			}
+		}
+	})
 }

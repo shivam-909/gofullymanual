@@ -9,7 +9,7 @@ import (
 const N = 100000000
 
 func main() {
-	slice := alloc.Allocate[*[N]int](8 * N)
+	slice := alloc.Allocate[[N]int](8 * N)
 	for i := range N {
 		slice[i] = i
 	}

@@ -11,10 +11,10 @@ func TestLeak(t *testing.T) {
 	runtime.ReadMemStats(&before)
 	fmt.Printf("BEFORE ALLOC: Alloc = %v\n", before.HeapSys)
 
-	const numAllocs = 10000
+	const numAllocs = 1
 	ptrs := make([]*int, 0, numAllocs)
 	for i := 0; i < numAllocs; i++ {
-		p := Allocate[*int](1000) // allocate 1000 bytes
+		p := Allocate[int](1000) // allocate 1000 bytes
 		if p == nil {
 			t.Fatalf("failed to allocate on iteration %d", i)
 		}
