@@ -1,447 +1,214 @@
 package alloc
 
 import (
-	"os"
-	"syscall"
+	"log"
 	"unsafe"
 )
 
-var (
-	chunkSize = os.Getpagesize()          // typically 4096
-	dWordSize = unsafe.Sizeof(uintptr(0)) // size of one word (8 bytes on 64-bit)
+const (
+	slabSize  = 64 * 1024
+	chunkSize = 16 * 1024 * 1024
+
+	mediumAllocationThreshold = 64 * 1024
 )
 
-type chunk struct {
-	base unsafe.Pointer
-	size int
-}
-
-// Global free list management
+// We accept some normal heap allocations
 var (
-	heaplist  unsafe.Pointer = nil // head of free list
-	allocated int
-	chunks    []chunk = make([]chunk, 0) // we kindly ask go for just this one heap allocation
+	smallSlabs  = make(map[uintptr][]*smallSlab)
+	mediumSlabs = make([]*mediumSlab, 0)
 )
 
-// Fixed block allocation management
-var (
-	fixedBlockFreeLists = make(map[int]unsafe.Pointer)
-	blockThresholdsList = blockThresholds()
-)
-
-func blockThresholds() []int {
-	return []int{
-		64,
-		128,
-		256,
-		512,
-		1024,
-		2048,
-		4096,
-		8192,
-	}
+type slabNode struct {
+	next *slabNode
 }
 
-func mmap(length int) unsafe.Pointer {
-	prot := uintptr(syscall.PROT_READ | syscall.PROT_WRITE)
-	flags := uintptr(syscall.MAP_PRIVATE | syscall.MAP_ANON)
-	fd := uintptr(^uint64(0)) // -1
-	offset := uintptr(0)
+type smallSlab struct {
+	// Base address of this slab
+	mem unsafe.Pointer
 
-	addr, _, errno := syscall.Syscall6(
-		syscall.SYS_MMAP,
-		0,
-		uintptr(length),
-		prot,
-		flags,
-		fd,
-		offset,
-	)
+	// Slabs are allocated "bump style"
+	// until we reach the end of the slab
+	bumpOffset uintptr
 
-	if int64(addr) == -1 {
-		panic(errno)
-	}
+	// A free list is maintained
+	// but isn't used for allocation
+	// until the bumpOffset is at it's max
+	freeList *slabNode
 
-	return unsafe.Pointer(addr)
+	// Size of the objects allocated
+	// in this slab
+	blockSize uintptr
 }
 
-func boolBit(b bool) uintptr {
-	if b {
-		return 1
-	}
-	return 0
+type freeBlock struct {
+	size uintptr
+	next *freeBlock
 }
 
-func bitBool(i uintptr) bool {
-	return i != 0
+type mediumSlab struct {
+	// Base address of this slab
+	mem unsafe.Pointer
+
+	// Total capacity of the slab
+	slabSize uintptr
+
+	// A free list is maintained for all
+	// medium sized object allocations
+	freeList *freeBlock
 }
 
-// Block layout & metadata
-//
-// [HEADER=8 bytes][PAYLOAD...][FOOTER=8 bytes]
-//
-// For a free block, the payload's first two words store
-// prevFree and nextFree pointers
-
-type blockMetadata struct {
-	// info has lower 3 bits for flags, upper bits for size
-	info uintptr
-}
-
-func setMd(h unsafe.Pointer, size uintptr, allocated bool) {
-	md := (*blockMetadata)(h)
-	md.info = size | boolBit(allocated)
-}
-
-func blockSize(h unsafe.Pointer) uintptr {
-	md := (*blockMetadata)(h)
-	return md.info & ^(uintptr(0x7))
-}
-
-func blockAllocated(h unsafe.Pointer) bool {
-	md := (*blockMetadata)(h)
-	return bitBool(md.info & 0x1)
-}
-
-func byteOffset(h unsafe.Pointer, bytes int) unsafe.Pointer {
-	return unsafe.Add(h, bytes)
-}
-
-// Returns pointer to the data area (after header)
-func blockPayload(h unsafe.Pointer) unsafe.Pointer {
-	return byteOffset(h, int(dWordSize))
-}
-
-// Returns pointer to the footer’s metadata
-func blockFooter(h unsafe.Pointer) unsafe.Pointer {
-	return byteOffset(h, int(dWordSize)+int(blockSize(h)))
-}
-
-func setBlockStatus(h unsafe.Pointer, allocated bool) {
-	s := blockSize(h)
-	f := blockFooter(h)
-	setMd(h, s, allocated)
-	setMd(f, s, allocated)
-}
-
-func blockPrevFree(h unsafe.Pointer) unsafe.Pointer {
-	payload := blockPayload(h)
-	return *(*unsafe.Pointer)(payload)
-}
-
-func blockNextFree(h unsafe.Pointer) unsafe.Pointer {
-	payload := blockPayload(h)
-	return *(*unsafe.Pointer)(byteOffset(payload, int(dWordSize)))
-}
-
-func setBlockPrevFree(h unsafe.Pointer, newPrev unsafe.Pointer) {
-	payload := blockPayload(h)
-	*(*unsafe.Pointer)(payload) = newPrev
-}
-
-func setBlockNextFree(h unsafe.Pointer, newNext unsafe.Pointer) {
-	payload := blockPayload(h)
-	*(*unsafe.Pointer)(byteOffset(payload, int(dWordSize))) = newNext
-}
-
-func inHeapBounds(h unsafe.Pointer) bool {
-	for _, chunk := range chunks {
-		heapBase := chunk.base
-		start := uintptr(heapBase)
-		end := start + uintptr(chunk.size)
-		ptr := uintptr(h)
-		if ptr >= start && ptr < end {
-			return true
-		}
-	}
-	return false
-}
-
-func nextAdjBlock(h unsafe.Pointer) unsafe.Pointer {
-	n := byteOffset(h, int(blockSize(h)+2*dWordSize))
-	if !inHeapBounds(n) {
-		return nil
-	}
-	return n
-}
-
-func prevAdjBlock(h unsafe.Pointer) unsafe.Pointer {
-	// The “footer” of the previous block is right before this header
-	footerPtr := byteOffset(h, -int(dWordSize))
-	if !inHeapBounds(footerPtr) {
-		return nil
+// Returns an aligned size if the object necessitates a small allocation
+// Else, returns 0, indicating a medium allocation is required
+func sizeClass(size uintptr) uintptr {
+	if size > mediumAllocationThreshold {
+		return 0
 	}
 
-	prevSize := (*blockMetadata)(footerPtr).info & ^(uintptr(0x7))
-	if prevSize == 0 {
-		return nil
+	// Simple implementation, just return the
+	// next highest power of 2.
+	c := uintptr(1)
+	for c < size {
+		c <<= 1
 	}
 
-	// The start of that previous block’s header:
-	prev := byteOffset(footerPtr, -int(prevSize+dWordSize))
-	if !inHeapBounds(prev) {
-		return nil
-	}
-	return prev
+	return c
 }
 
-func removeFromFreeList(h unsafe.Pointer) {
-	pf := blockPrevFree(h)
-	nf := blockNextFree(h)
+// Gets a slab with free space
+// or creates a new slab
+func getSlab(size uintptr) *smallSlab {
+	slabs := smallSlabs[size]
 
-	if pf != nil {
-		setBlockNextFree(pf, nf)
-	} else {
-		// h was the head
-		heaplist = nf
-	}
-
-	if nf != nil {
-		setBlockPrevFree(nf, pf)
-	}
-}
-
-func insertAtFreeListHead(h unsafe.Pointer) {
-	setBlockPrevFree(h, nil)
-	setBlockNextFree(h, heaplist)
-	if heaplist != nil {
-		setBlockPrevFree(heaplist, h)
-	}
-	heaplist = h
-}
-
-// Create a free block of `size` at pointer h, mark header/footer, add to free list
-func createAtFreeListHead(h unsafe.Pointer, size uintptr) {
-	setMd(h, size, false)
-	setMd(blockFooter(h), size, false)
-	insertAtFreeListHead(h)
-}
-
-func alignedSize(size int) int {
-	const alignment = 8
-	return (size + alignment - 1) & ^(alignment - 1)
-}
-
-func coalesceBlock(h unsafe.Pointer) {
-	n := nextAdjBlock(h)
-	p := prevAdjBlock(h)
-
-	// If next block is free, remove it and combine
-	if n != nil && !blockAllocated(n) {
-		removeFromFreeList(n)
-		newSize := blockSize(h) + blockSize(n) + 2*dWordSize
-		setMd(h, newSize, false)
-		setMd(blockFooter(h), newSize, false)
-	}
-
-	// If previous block is free, remove it and combine
-	if p != nil && !blockAllocated(p) {
-		removeFromFreeList(p)
-		newSize := blockSize(p) + blockSize(h) + 2*dWordSize
-		setMd(p, newSize, false)
-		setMd(blockFooter(p), newSize, false)
-		h = p
-	}
-
-	insertAtFreeListHead(h)
-}
-
-func initFreeList() {
-
-	p := extendHeap(chunkSize)
-	if p == nil {
-		panic("failed to init heap")
-	}
-	heaplist = p
-}
-
-// Allocates a new chunk via mmap, creates one big free block, returns pointer
-func extendHeap(sizeNeeded int) unsafe.Pointer {
-	if sizeNeeded < chunkSize {
-		sizeNeeded = chunkSize
-	} else {
-		remainder := sizeNeeded % chunkSize
-		if remainder != 0 {
-			sizeNeeded += (chunkSize - remainder)
+	// See if we have a slab for this size
+	for _, slab := range slabs {
+		if slab.freeList != nil || slab.bumpOffset+size <= slabSize {
+			return slab
 		}
 	}
 
-	p := mmap(sizeNeeded)
-	if p == nil {
+	ptr := mmap(slabSize)
+	if ptr == nil {
 		return nil
 	}
 
-	createAtFreeListHead(p, uintptr(sizeNeeded)-2*dWordSize)
+	slab := &smallSlab{
+		mem:        ptr,
+		bumpOffset: 0,
+		freeList:   nil,
+		blockSize:  size,
+	}
 
-	chunks = append(chunks, chunk{p, sizeNeeded})
-
-	return p
+	slabs = append(slabs, slab)
+	smallSlabs[size] = slabs
+	return slab
 }
 
-func findFreeBlock(size int) unsafe.Pointer {
-	for c := heaplist; c != nil; c = blockNextFree(c) {
-		if blockSize(c) >= uintptr(size) {
-			return c
+func allocateSmallObject(size uintptr) unsafe.Pointer {
+	sizeclass := sizeClass(size)
+	if sizeclass == 0 {
+		panic("allocateSmallObject called with a medium sized allocation")
+	}
+
+	slab := getSlab(sizeclass)
+
+	if slab.freeList != nil {
+		nextFree := slab.freeList
+		slab.freeList = nextFree.next
+		return unsafe.Pointer(nextFree)
+	}
+
+	if slab.bumpOffset+sizeclass <= slabSize {
+		addr := unsafe.Add(slab.mem, slab.bumpOffset)
+		slab.bumpOffset += sizeclass
+		return addr
+	}
+
+	log.Println("size:", size)
+	log.Println("sizeClass:", sizeclass)
+	log.Println("slab.bumpOffset+sizeclass:", slab.bumpOffset+sizeclass)
+	log.Println("slabs:", smallSlabs)
+	log.Println("slabSize:", slabSize)
+	log.Printf("slab: %#v\n", slab)
+
+	panic("unable to allocate small object")
+}
+
+func findSlabForObj(slabs []*smallSlab, ptr unsafe.Pointer) *smallSlab {
+	p := uintptr(ptr)
+	for _, s := range slabs {
+		start := uintptr(s.mem)
+		end := start + slabSize
+		if p >= start && p < end {
+			return s
 		}
 	}
 
-	// Else, grow
-	return extendHeap(size)
+	return nil
 }
 
-func allocateBlock(h unsafe.Pointer, size int) {
-	if blockAllocated(h) {
-		return
+func freeSmallObject(ptr unsafe.Pointer, size uintptr) {
+	sizeclass := sizeClass(size)
+	if sizeclass == 0 {
+		panic("freeSmallObject called with a medium sized allocation")
 	}
-	removeFromFreeList(h)
-	setBlockStatus(h, true)
 
-	oldSize := blockSize(h)
-	minSpare := uintptr(4 * dWordSize) // enough room for header+footer + pointers
-	if oldSize >= uintptr(size)+(minSpare*4) {
-		// Split
-		setMd(h, uintptr(size), true)
-		setMd(blockFooter(h), uintptr(size), true)
+	slabs := smallSlabs[sizeclass]
 
-		// The leftover chunk starts after this block’s header+footer+payload
-		freeBlockPtr := byteOffset(h, int(uintptr(size)+2*dWordSize))
-		spare := oldSize - uintptr(size) - 2*dWordSize
-
-		setMd(freeBlockPtr, spare, false)
-		setMd(blockFooter(freeBlockPtr), spare, false)
-
-		coalesceBlock(freeBlockPtr)
+	allocatedSlab := findSlabForObj(slabs, ptr)
+	if allocatedSlab == nil {
+		log.Println(sizeclass, smallSlabs)
+		log.Fatalf("pointer %p not accounted for by allocator", ptr)
 	}
+
+	node := (*slabNode)(ptr)
+	node.next = allocatedSlab.freeList
+	allocatedSlab.freeList = node
 }
 
-func allocateFixedBlock(size int) unsafe.Pointer {
-	if freeListHead, exists := fixedBlockFreeLists[size]; exists && freeListHead != nil {
-		removeFromFreeList(freeListHead)
-		setBlockStatus(freeListHead, true)
-		return freeListHead
+// Allocates enough memory for count * T items and returns a pointer
+// to the newly allocated memory
+func Allocate[T any](count int) *T {
+	sz := uintptr(count) * unsafe.Sizeof(*new(T))
+
+	if sz <= mediumAllocationThreshold {
+		return (*T)(allocateSmallObject(sz))
 	}
 
-	asize := alignedSize(size)
-	h := findFreeBlock(asize)
-	if h == nil {
-		return nil
-	}
-
-	allocateBlock(h, asize)
-	return h
-}
-
-func Allocate[T any](size int) *T {
-	asize := alignedSize(size)
-	if asize < int(4*dWordSize) {
-		asize = int(4 * dWordSize)
-	}
-
-	for _, threshold := range blockThresholdsList {
-		if asize <= threshold && asize >= int(float64(threshold)*0.8) {
-			h := allocateFixedBlock(threshold)
-			if h != nil {
-				allocated++
-				return (*T)(blockPayload(h))
-			}
-			break
-		}
-	}
-
-	h := findFreeBlock(asize)
-	if h == nil {
-		return nil
-	}
-
-	allocateBlock(h, asize)
-	allocated++
-	return (*T)(blockPayload(h))
-}
-
-// Updated AllocateSlice function
-func AllocateSlice[T any](length int) []T {
-	size := length * int(unsafe.Sizeof(*new(T)))
-	dataPtr := Allocate[T](size)
-	if dataPtr == nil {
-		return nil
-	}
-	return unsafe.Slice(dataPtr, length)
-}
-
-func munmap(p unsafe.Pointer, size int) {
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_MUNMAP,
-		uintptr(p),
-		uintptr(size),
-		0,
-	)
-	if errno != 0 {
-		panic(errno)
-	}
+	panic("too large to allocate")
 }
 
 // Free a previously allocated pointer
-func Free[T any](ptr *T) {
-	p := unsafe.Pointer(ptr)
-	if p == nil {
+func Free[T any](ptr *T, count int) {
+	if ptr == nil {
 		return
 	}
 
-	blockHeader := byteOffset(p, -int(dWordSize))
-	if !blockAllocated(blockHeader) {
+	sz := uintptr(count) * unsafe.Sizeof(*new(T))
+
+	if sz <= mediumAllocationThreshold {
+		freeSmallObject(unsafe.Pointer(ptr), sz)
 		return
 	}
 
-	blockSize := int(blockSize(blockHeader))
-	for _, threshold := range blockThresholdsList {
-		if blockSize == threshold {
-			setBlockStatus(blockHeader, false)
-			insertAtFixedFreeList(blockHeader, threshold)
-			allocated--
-			return
-		}
+	panic("not tracked by allocator (too large)")
+}
+
+func AllocateSlice[T any](elements int) []T {
+	sz := unsafe.Sizeof(*new(T)) * uintptr(elements)
+
+	if sz <= mediumAllocationThreshold {
+		ptr := Allocate[T](int(sz))
+		return ([]T)(unsafe.Slice(ptr, sz))
 	}
 
-	setBlockStatus(blockHeader, false)
-	coalesceBlock(blockHeader)
-
-	allocated--
-	if allocated < 1 {
-		for _, chunk := range chunks {
-			munmap(chunk.base, chunk.size)
-		}
-		chunks = chunks[:0]
-		heaplist = nil
-		initFreeList()
-	}
+	panic("too large to allocate")
 }
 
 func FreeSlice[T any](slice []T) {
-	p := &slice[0]
-	Free(p)
-}
-
-func insertAtFixedFreeList(h unsafe.Pointer, size int) {
-	setBlockPrevFree(h, nil)
-	setBlockNextFree(h, fixedBlockFreeLists[size])
-	if fixedBlockFreeLists[size] != nil {
-		setBlockPrevFree(fixedBlockFreeLists[size], h)
-	}
-	fixedBlockFreeLists[size] = h
-}
-
-// Helper function to initialize fixed block free lists
-func initFixedBlockFreeLists() {
-	for _, threshold := range blockThresholdsList {
-		fixedBlockFreeLists[threshold] = nil
-	}
+	ptr := &slice[0]
+	Free(ptr, len(slice))
 }
 
 func Sizeof[T any](x T) int {
 	return int(unsafe.Sizeof(x))
-}
-
-func init() {
-	initFreeList()
-	initFixedBlockFreeLists()
 }

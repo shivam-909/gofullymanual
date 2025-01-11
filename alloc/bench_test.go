@@ -18,27 +18,28 @@ func fuzz(n int) int {
 
 func BenchmarkAllocs(b *testing.B) {
 	rand.Seed(42)
-	allocationSizes := []int{256, 5120, 10000}
+	allocationSizes := []int{256, 5120}
 	NValues := []int{1000, 10000, 100000}
 
 	for _, size := range allocationSizes {
+		l := fuzz(size)
 		for _, N := range NValues {
-			b.Run(fmt.Sprintf("CustomAllocator_Size%d_N%d", size, N), func(b *testing.B) {
-				p := Allocate[int](9)
+			b.Run(fmt.Sprintf("MyAlloc_%d-Bytes_%d-Times", size, N), func(b *testing.B) {
+				p := Allocate[int](1)
 				for i := 0; i < b.N; i++ {
 					for j := 0; j < N; j++ {
-						slice := AllocateSlice[int](fuzz(size))
+						slice := AllocateSlice[int](l)
 						slice[0] = 1
 						FreeSlice(slice)
 					}
 				}
-				Free(p)
+				Free(p, 1)
 			})
 
-			b.Run(fmt.Sprintf("StandardAllocator_Size%d_N%d", size, N), func(b *testing.B) {
+			b.Run(fmt.Sprintf("StandardAlloc_%d-Bytes_%d-Times", size, N), func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					for j := 0; j < N; j++ {
-						slice := make([]int, fuzz(size))
+						slice := make([]int, fuzz(l))
 						slice[0] = 1
 					}
 				}
