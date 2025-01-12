@@ -2,12 +2,14 @@ package alloc
 
 import (
 	"log"
+	"math/bits"
 	"unsafe"
 )
 
 const (
-	slabSize  = 64 * 1024
-	chunkSize = 16 * 1024 * 1024
+	slabSize  = 256 * 1024
+	chunkSize = 32 * 1024 * 1024
+	arenaSize = 8 * chunkSize
 
 	mediumAllocationThreshold = 64 * 1024
 )
@@ -16,6 +18,9 @@ const (
 var (
 	smallSlabs  = make(map[uintptr][]*smallSlab)
 	mediumSlabs = make([]*mediumSlab, 0)
+
+	globalArena  = unsafe.Pointer(nil)
+	globalOffset = 0
 )
 
 type slabNode struct {
@@ -57,21 +62,40 @@ type mediumSlab struct {
 	freeList *freeBlock
 }
 
-// Returns an aligned size if the object necessitates a small allocation
-// Else, returns 0, indicating a medium allocation is required
-func sizeClass(size uintptr) uintptr {
-	if size > mediumAllocationThreshold {
+func sizeToSizeClass(size uintptr) uint8 {
+	size = size - 1
+
+	leadingZeros := uint8(bits.LeadingZeros64(uint64(size | 32)))
+
+	e := uint8(61) - leadingZeros
+
+	b := uint8(0)
+	if e != 0 {
+		b = 1
+	}
+	shift := 4 + e - b
+	m := uint8((size >> shift) & 3)
+
+	return (e << 2) + m
+}
+
+func sizeClassToSize(sizeclass uint8) uintptr {
+	if sizeclass == 0 {
 		return 0
 	}
 
-	// Simple implementation, just return the
-	// next highest power of 2.
-	c := uintptr(1)
-	for c < size {
-		c <<= 1
+	e := sizeclass >> 2
+	m := sizeclass & 3
+
+	b := uint8(0)
+	if e != 0 {
+		b = 1
 	}
 
-	return c
+	baseSize := uintptr(16 + m*4)
+	shift := e - b
+
+	return baseSize << shift
 }
 
 // Gets a slab with free space
@@ -104,7 +128,8 @@ func getSlab(size uintptr) *smallSlab {
 }
 
 func allocateSmallObject(size uintptr) unsafe.Pointer {
-	sizeclass := sizeClass(size)
+	c := sizeToSizeClass(size)
+	sizeclass := sizeClassToSize(c)
 	if sizeclass == 0 {
 		panic("allocateSmallObject called with a medium sized allocation")
 	}
@@ -147,7 +172,8 @@ func findSlabForObj(slabs []*smallSlab, ptr unsafe.Pointer) *smallSlab {
 }
 
 func freeSmallObject(ptr unsafe.Pointer, size uintptr) {
-	sizeclass := sizeClass(size)
+	c := sizeToSizeClass(size)
+	sizeclass := sizeClassToSize(c)
 	if sizeclass == 0 {
 		panic("freeSmallObject called with a medium sized allocation")
 	}

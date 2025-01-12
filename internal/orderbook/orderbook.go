@@ -5,10 +5,11 @@ import "math/rand/v2"
 type OrderSide int
 
 const (
-	OrderSideBuy  = 1
-	OrderSideSell = 2
-	MaxPrice      = 10000
-	MinPrice      = 9000
+	OrderSideBuy  OrderSide = 1
+	OrderSideSell OrderSide = 2
+
+	MaxPrice = 10000
+	MinPrice = 9000
 )
 
 var counter int = 1

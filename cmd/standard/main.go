@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/shivam-909/gofullymanual/internal/orderbook"
@@ -9,8 +11,14 @@ import (
 )
 
 func main() {
+
+	ns := os.Args[1]
+	N, err := strconv.Atoi(ns)
+	if err != nil {
+		panic(err)
+	}
+
 	ob := standardbook.New()
-	N := 2500000
 
 	start := time.Now()
 
@@ -21,6 +29,5 @@ func main() {
 	elapsed := time.Since(start)
 	average := elapsed / time.Duration(N)
 
-	fmt.Printf("Total time for %d operations: %v\n", N, elapsed)
-	fmt.Printf("Average time per operation: %v\n", average)
+	fmt.Printf("Standard Allocator || %d OPS || TOTAL: %v || AVERAGE: %v\n", N, elapsed, average)
 }
